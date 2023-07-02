@@ -24,6 +24,9 @@ struct RustWasm {
     export_modules: BTreeMap<Option<PackageName>, Vec<String>>,
     skip: HashSet<String>,
     interface_names: HashMap<InterfaceId, String>,
+    lower_functions: HashMap<TypeId, String>,
+    dealloc_functions: HashMap<TypeId, String>,
+    lower_list_functions: HashMap<Type, String>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -341,6 +344,16 @@ impl WorldGenerator for RustWasm {
             pub fn __link_section() {}
         ",
         );
+
+        self.lower_functions
+            .values()
+            .for_each(|f| self.src.push_str(&f));
+        self.dealloc_functions
+            .values()
+            .for_each(|f| self.src.push_str(&f));
+        self.lower_list_functions
+            .values()
+            .for_each(|f| self.src.push_str(&f));
 
         let mut src = mem::take(&mut self.src);
         if self.opts.rustfmt {
@@ -726,6 +739,15 @@ impl InterfaceGenerator<'_> {
 
         self.gen.exports.push(macro_src);
     }
+
+    fn rust_type(&mut self, ty: &Type, mode: TypeMode) -> String {
+        let initial = self.src.as_mut_string().len();
+        self.print_ty(ty, mode);
+        let gen_src = self.src.as_mut_string();
+        let type_name = (&gen_src.as_str()[initial..]).to_string();
+        gen_src.replace_range(initial.., "");
+        type_name
+    }
 }
 
 impl<'a> RustGenerator<'a> for InterfaceGenerator<'a> {
@@ -909,6 +931,16 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             cleanup: Vec::new(),
             import_return_pointer_area_size: 0,
             import_return_pointer_area_align: 0,
+        }
+    }
+
+    fn save_lower_function(&mut self, ty: &TypeId, output: String) -> i32 {
+        if self.gen.gen.lower_functions.contains_key(ty) {
+            retrieve_offset(output)
+        } else {
+            let (base_offset, output) = map_and_retrieve_offset(output);
+            self.gen.gen.lower_functions.insert(*ty, output);
+            base_offset
         }
     }
 
@@ -1202,18 +1234,25 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     .collect::<Vec<_>>();
                 self.let_results(result_types.len(), results);
                 let op0 = &operands[0];
-                self.push_str(&format!("match {op0} {{\n"));
                 let name = self.typename_lower(*ty);
+
+                let mut output = String::new();
+                output.push_str(&format!(
+                    "unsafe fn lower_{name}(base: i32, {op0}: {name}) {{ match {op0} {{\n"
+                ));
                 for (case, block) in variant.cases.iter().zip(blocks) {
                     let case_name = case.name.to_upper_camel_case();
-                    self.push_str(&format!("{name}::{case_name}"));
+                    output.push_str(&format!("{name}::{case_name}"));
                     if case.ty.is_some() {
-                        self.push_str(&format!("(e) => {block},\n"));
+                        output.push_str(&format!("(e) => {block},\n"));
                     } else {
-                        self.push_str(&format!(" => {{\n{block}\n}}\n"));
+                        output.push_str(&format!(" => {{\n{block}\n}}\n"));
                     }
                 }
-                self.push_str("};\n");
+                output.push_str("}}\n");
+
+                let base_offset = self.save_lower_function(ty, output);
+                self.push_str(&format!("lower_{name}(base + {base_offset}, {op0});"));
             }
 
             Instruction::VariantLift {
@@ -1288,12 +1327,19 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     .collect::<Vec<_>>();
                 self.let_results(result_types.len(), results);
                 let op0 = &operands[0];
-                self.push_str(&format!("match {op0} {{\n"));
                 let name = self.typename_lower(*ty);
+
+                let mut output = String::new();
+                output.push_str(&format!(
+                    "unsafe fn lower_{name}(base: i32, {op0}: {name}) {{ match {op0} {{\n"
+                ));
                 for (case_name, block) in self.gen.union_case_names(union).into_iter().zip(blocks) {
-                    self.push_str(&format!("{name}::{case_name}(e) => {block},\n"));
+                    output.push_str(&format!("{name}::{case_name}(e) => {block},\n"));
                 }
-                self.push_str("};\n");
+                output.push_str("}}\n");
+
+                let base_offset = self.save_lower_function(ty, output);
+                self.push_str(&format!("lower_{name}(base + {base_offset}, {op0});"));
             }
 
             Instruction::UnionLift { union, ty, .. } => {
@@ -1396,14 +1442,26 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             }
 
             Instruction::EnumLower { enum_, ty, .. } => {
-                let mut result = format!("match {} {{\n", operands[0]);
+                let op0 = &operands[0];
+                let tag_type = match enum_.tag() {
+                    Int::U8 => "u8",
+                    Int::U16 => "u16",
+                    Int::U32 => "u32",
+                    Int::U64 => "u64",
+                };
+                // TODO: support enum in interface
                 let name = self.gen.type_path(*ty, true);
+
+                let mut output =
+                    format!("fn lower_{name}({op0}: {name}) -> {tag_type} {{ match {op0} {{\n");
                 for (i, case) in enum_.cases.iter().enumerate() {
                     let case = case.name.to_upper_camel_case();
-                    result.push_str(&format!("{name}::{case} => {i},\n"));
+                    output.push_str(&format!("{name}::{case} => {i},\n"));
                 }
-                result.push_str("}");
-                results.push(result);
+                output.push_str("}}");
+
+                self.save_lower_function(ty, output);
+                results.push(format!("lower_{name}({op0})"));
             }
 
             Instruction::EnumLift { enum_, ty, .. } => {
@@ -1550,7 +1608,17 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 self.push_str(&format!(
                     "let base = {result} as i32 + (i as i32) * {size};\n",
                 ));
-                self.push_str(&body);
+
+                let mut name = String::new();
+                self.gen.write_name(element, &mut name);
+                let type_name = self.gen.rust_type(*element, TypeMode::Owned);
+
+                self.gen.gen.lower_list_functions.insert(
+                    **element,
+                    format!("unsafe fn lower_list_{name}(base: i32, e: {type_name}) {body}\n"),
+                );
+                self.push_str(&format!("lower_list_{name}(base, e);"));
+
                 self.push_str("}\n");
                 results.push(format!("{result} as i32"));
                 results.push(len);
@@ -1763,6 +1831,11 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             }
 
             Instruction::GuestDeallocateList { element } => {
+                let ty = match element {
+                    Type::Id(id) => Some(id),
+                    _ => None,
+                };
+
                 let body = self.blocks.pop().unwrap();
                 let tmp = self.tmp();
                 let size = self.gen.sizes.size(element);
@@ -1787,7 +1860,18 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     self.push_str(" + i *");
                     self.push_str(&size.to_string());
                     self.push_str(";\n");
-                    self.push_str(&body);
+                    if let Some(ty) = ty {
+                        // TODO: use self.gen.rust_type
+                        let mut name = String::new();
+                        self.gen.write_name(element, &mut name);
+                        self.gen
+                            .gen
+                            .dealloc_functions
+                            .insert(*ty, format!("unsafe fn dealloc_{name}(base: i32) {body}\n"));
+                        self.push_str(&format!("dealloc_{name}(base);"));
+                    } else {
+                        self.push_str(&body);
+                    }
                     self.push_str("\n}\n");
                 }
                 self.push_str(&format!(
@@ -1796,4 +1880,57 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             }
         }
     }
+}
+
+fn retrieve_offset(output: String) -> i32 {
+    let chars = output.chars().collect::<Vec<_>>();
+    let mut matches = output.match_indices("base +");
+    if let Some(m) = matches.next() {
+        find_number(&chars, m.0 + 6).0
+    } else {
+        0
+    }
+}
+
+fn map_and_retrieve_offset(output: String) -> (i32, String) {
+    let chars = output.chars().collect::<Vec<_>>();
+    let matches = output.match_indices("base +");
+
+    let mut base_offset: Option<i32> = None;
+    let mut output_mapped = output.clone();
+    let mut it_offset: i32 = 0;
+
+    for m in matches.into_iter() {
+        let (v, r) = find_number(&chars, m.0 + 6);
+        let mapped_r = (r.start as i32 + it_offset) as usize..(r.end as i32 + it_offset) as usize;
+        it_offset = if let Some(base_offset) = base_offset {
+            let n: i32 = v - base_offset;
+            output_mapped.replace_range(mapped_r, &n.to_string());
+            it_offset + n.to_string().len() as i32 - r.len() as i32
+        } else {
+            base_offset = Some(v);
+            output_mapped.replace_range(mapped_r, "0");
+            it_offset + 1 - r.len() as i32
+        }
+    }
+
+    (base_offset.unwrap_or(0), output_mapped)
+}
+
+fn find_number(chars: &Vec<char>, mut initial: usize) -> (i32, std::ops::Range<usize>) {
+    while chars[initial].is_whitespace() {
+        initial += 1;
+    }
+    let mut index = initial;
+    while chars[index].is_numeric() || chars[index] == '-' {
+        index += 1;
+    }
+    let r = initial..index;
+    let v = (&chars[r.clone()])
+        .iter()
+        .collect::<String>()
+        .parse::<i32>()
+        .unwrap();
+
+    (v, r)
 }
